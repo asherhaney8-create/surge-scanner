@@ -1,6 +1,0 @@
-streamlit>=1.36
-yfinance>=0.2.40
-finnhub-python>=2.4
-pandas>=2.0
-lxml>=5.0
-streamlit-autorefresh>=1.0
