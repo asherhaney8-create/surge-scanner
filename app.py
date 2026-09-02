@@ -543,4 +543,102 @@ with tab_ov:
         # a plain-language read on why volume is moving
         st.markdown(
             f"<div style='background:#141924;border-left:3px solid #f0a63a;border-radius:8px;"
-      
+            f"padding:12px 14px;margin:6px 0 12px;color:#c9d2e0;font-size:14px'>"
+            f"The move started when this story broke ~{ago(news['mins'])}, and volume immediately "
+            f"jumped to <b>{d['rvol']:.1f}× normal</b>. That's the market repricing "
+            f"<b>{d['name']}</b> on the news — demand outpacing supply, not random drift.</div>",
+            unsafe_allow_html=True)
+        if news.get("summary"):
+            st.write(news["summary"])
+        if news.get("url"):
+            st.markdown(f"[Read full story →]({news['url']})")
+        # deeper: more recent coverage
+        more = news.get("more") or []
+        if more:
+            st.markdown(f"**More coverage** · {news.get('count', len(more))} recent stories")
+            for m in more:
+                link = f"[{m['headline']}]({m['url']})" if m.get("url") else m["headline"]
+                st.markdown(
+                    f"<div style='padding:7px 0;border-top:1px solid #1a202d;font-size:13px'>"
+                    f"{link}<br><span style='color:#6b7690;font-size:11px'>{m['source']} · {ago(m['mins'])}</span></div>",
+                    unsafe_allow_html=True)
+    else:
+        st.info("No fresh headline found in the news window for this name. "
+                "Widen the news window in the sidebar to see older stories.")
+
+# ---- Chart: live TradingView 1-minute ----
+with tab_chart:
+    st.caption("Live interactive 1-minute chart · powered by TradingView")
+    tv = f"""
+    <div class="tradingview-widget-container" style="height:460px">
+      <div id="tv_{d['sym']}" style="height:460px"></div>
+      <script src="https://s3.tradingview.com/tv.js"></script>
+      <script>
+      new TradingView.widget({{
+        "autosize": true, "symbol": "{d['sym']}", "interval": "1",
+        "timezone": "America/New_York", "theme": "dark", "style": "1",
+        "locale": "en", "hide_top_toolbar": false, "hide_legend": false,
+        "allow_symbol_change": true, "container_id": "tv_{d['sym']}"
+      }});
+      </script>
+    </div>"""
+    components.html(tv, height=470)
+    st.caption("If the chart is blank, TradingView may need an exchange prefix "
+               "(e.g. NASDAQ:AAPL) — use the symbol box on the chart itself.")
+
+# ---- Volume: session split + per-minute chart ----
+with tab_vol:
+    h = get_minutes(d["sym"])
+    if h is None or h.empty:
+        st.info("Minute data isn't available for this ticker right now.")
+    else:
+        t = h.index.time
+        def sess(x):
+            if x < dt.time(9, 30): return "Pre-market"
+            if x < dt.time(16, 0): return "Regular"
+            return "Post-market"
+        h = h.copy()
+        h["Session"] = [sess(x) for x in t]
+        totals = h.groupby("Session")["Volume"].sum()
+        tot = totals.sum() or 1
+        s1, s2, s3 = st.columns(3)
+        for col, name in [(s1, "Pre-market"), (s2, "Regular"), (s3, "Post-market")]:
+            v = int(totals.get(name, 0))
+            col.metric(name, fmt_vol(v), f"{v/tot*100:.0f}% of day")
+
+        st.markdown("**Volume per minute** — watch the ramp; a spike is demand outpacing supply *now*.")
+        st.bar_chart(h["Volume"], height=240, color="#2ecb8f")
+
+# ---- Price target: real analyst consensus ----
+with tab_tgt:
+    if not d["target"] or not d["n_analysts"]:
+        st.info("No analyst price-target coverage for this ticker.")
+    else:
+        up = (d["target"] - d["price"]) / d["price"] * 100
+        st.markdown(f"<div style='text-align:center'>"
+                    f"<div style='font-size:40px;font-weight:700;color:{'#2ecb8f' if up>=0 else '#f0685a'};"
+                    f"font-family:IBM Plex Mono,monospace'>{'+' if up>=0 else ''}{up:.0f}%</div>"
+                    f"<div style='color:#6b7690'>upside to consensus target "
+                    f"<b class='mono'>${d['target']:.2f}</b> · {d['n_analysts']} analysts</div></div>",
+                    unsafe_allow_html=True)
+        lo, hi = d.get("target_lo"), d.get("target_hi")
+        if lo and hi and hi > lo:
+            pos = max(0, min(100, (d["price"] - lo) / (hi - lo) * 100))
+            tpos = max(0, min(100, (d["target"] - lo) / (hi - lo) * 100))
+            st.markdown(f"""
+            <div style='margin:26px 4px 6px;position:relative;height:8px;border-radius:5px;
+                 background:linear-gradient(90deg,#3a1c1a,#212836,#123027)'>
+              <div style='position:absolute;left:{pos:.0f}%;top:-6px;width:12px;height:12px;border-radius:50%;
+                   background:#e9edf5;border:2px solid #0c0f16;transform:translateX(-50%)'></div>
+              <div style='position:absolute;left:{tpos:.0f}%;top:-6px;width:12px;height:12px;border-radius:50%;
+                   background:#2ecb8f;border:2px solid #0c0f16;transform:translateX(-50%)'></div>
+            </div>
+            <div style='display:flex;justify-content:space-between;font-size:11px;color:#6b7690;
+                 font-family:IBM Plex Mono,monospace'><span>low ${lo:.2f}</span>
+                 <span>⚪ now &nbsp; 🟢 target</span><span>high ${hi:.2f}</span></div>
+            """, unsafe_allow_html=True)
+        st.warning("These are **real published analyst targets** — not a prediction of where the "
+                   "news will take the stock. Targets are opinions, often lag fast-moving news, and "
+                   "are frequently wrong. Never a substitute for your own research.", icon="⚠️")
+
+st.caption("Surge surfaces candidates · not financial advice · a stock already up on the day can reverse.")
