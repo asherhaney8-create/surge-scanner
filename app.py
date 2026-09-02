@@ -29,14 +29,15 @@ except Exception:
 # ----------------------------------------------------------------------------
 # PAGE SETUP
 # ----------------------------------------------------------------------------
-st.set_page_config(page_title="Surge Scanner", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Surge Scanner", page_icon="📈", layout="wide",
+                   initial_sidebar_state="expanded")
 
 # ---- Surge look & feel (dark, amber beacon accent) -------------------------
 st.markdown("""
 <style>
 :root { --accent:#f0a63a; --up:#2ecb8f; --down:#f0685a; }
 .stApp { background:#0c0f16; }
-#MainMenu, footer, header {visibility:hidden;}
+#MainMenu, footer {visibility:hidden;}  /* keep the header so the sidebar arrow stays visible */
 .block-container{padding-top:1.2rem; max-width:1200px;}
 h1,h2,h3,h4,p,span,div,label { color:#e9edf5; font-family:"IBM Plex Sans",system-ui,sans-serif; }
 .mono, .mono * { font-family:"IBM Plex Mono",monospace; }
@@ -275,6 +276,38 @@ with c2:
 if not FINNHUB_KEY:
     st.warning("No Finnhub key set — news is off. Add FINNHUB_KEY in app settings → Secrets. "
                "(See DEPLOY_GUIDE.md step 4.)", icon="🔑")
+
+# ---- friendly guide for first-time visitors ----
+with st.expander("👋 New here? How to read this board (30-second guide)"):
+    st.markdown("""
+**What this is.** Surge scans the market and shows stocks that are *in play right now* —
+meaning something just happened and traders are piling in. It updates itself every couple of minutes.
+
+**Every stock here passes three tests at once:**
+1. **Up today, +5% to +10%** — it's already moving, but hasn't gone parabolic.
+2. **Heavy volume (RVOL ≥ 2×)** — it's trading at least twice its normal pace, so demand is real, not a fluke.
+3. **Fresh news** — there's an actual reason behind the move (earnings, a deal, an approval).
+
+**Reading a row, left to right:**
+- **Price** – what one share costs right now.
+- **% Chg** – how much it's up today.
+- **R.Vol** – "relative volume." *2× = twice the usual trading.* Higher = more heat.
+- **Volume** – total shares traded today.
+- **Float** – how many shares are actually available to trade. A **low float** can move fast and hard.
+- **Target** – how far the average Wall-Street analyst target sits above today's price *(an opinion, not a promise)*.
+- **Why it's moving** – the headline behind the move.
+
+**Want the full story on one stock?** Use the **🔍 Inspect a ticker** box below the table — you'll get a
+live 1-minute chart, its volume minute-by-minute (pre-market, regular hours, and after-hours), the news, and the analyst price target.
+
+**The S&P 500 / Outside toggle** lets you split big, well-known companies from smaller, faster-moving ones.
+
+**Tweak it to your taste** with the settings panel on the left (arrow at top-left): change how many
+stocks show, the % range, how much volume counts, and the price range.
+
+> ⚠️ **Important:** This is a *starting point for research, not advice.* A stock that's already up can
+> reverse just as fast. Surge points you at what's active — what you do next is your call.
+""")
 
 # ----------------------------------------------------------------------------
 # SCANNER TABLE
