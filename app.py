@@ -171,6 +171,8 @@ def get_stock(sym):
         "target_hi": info.get("targetHighPrice"),
         "target_lo": info.get("targetLowPrice"),
         "n_analysts": info.get("numberOfAnalystOpinions"),
+        "pre_price": info.get("preMarketPrice"),
+        "post_price": info.get("postMarketPrice"),
     }
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -234,23 +236,89 @@ def fmt_float(f):
 def ago(m):
     return f"{m}m ago" if m < 60 else f"{m//60}h {m%60}m ago"
 
-def run_scan():
+import zoneinfo
+
+def et_now():
+    return dt.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+
+def current_session():
+    """Which US market session is live right now (ET)."""
+    t = et_now().time()
+    if dt.time(4, 0) <= t < dt.time(9, 30):  return "pre"
+    if dt.time(9, 30) <= t < dt.time(16, 0): return "live"
+    if dt.time(16, 0) <= t < dt.time(20, 0): return "post"
+    return "closed"
+
+def load_universe():
+    """One pass over the mover lists → every candidate with its regular-session numbers."""
     sp = get_sp500()
-    rows = []
+    out = []
     for sym in get_universe():
         d = get_stock(sym)
         if not d:
             continue
+        d["sp500"] = sym in sp
+        out.append(d)
+    return out
+
+def session_volume(h, sess):
+    """Sum 1-minute volume within a session window (pre / regular / post)."""
+    if h is None or h.empty:
+        return None
+    times = h.index.time
+    if sess == "pre":
+        mask = [t < dt.time(9, 30) for t in times]
+    elif sess == "post":
+        mask = [t >= dt.time(16, 0) for t in times]
+    else:
+        mask = [dt.time(9, 30) <= t < dt.time(16, 0) for t in times]
+    return int(h["Volume"][mask].sum())
+
+def apply_market_filter(stocks, view):
+    if view.startswith("S&P"):
+        return [d for d in stocks if d.get("sp500")]
+    if view.startswith("Outside"):
+        return [d for d in stocks if not d.get("sp500")]
+    return stocks
+
+def scan_regular(stocks):
+    """The core live-session scan: up 5–10%, heavy volume, fresh news."""
+    rows = []
+    for d in stocks:
         if not (chg_min <= d["chg"] <= chg_max): continue
         if d["rvol"] < rvol_min: continue
         if not (price_min <= d["price"] <= price_max): continue
-        d["news"] = get_news(sym, news_hours)
+        d["news"] = get_news(d["sym"], news_hours)
         if require_news and not d["news"]:
             continue
-        d["sp500"] = d["sym"] in sp
         rows.append(d)
     rows.sort(key=lambda x: x["vol"], reverse=True)
-    return rows   # the S&P toggle + top_n slice are applied where the table is drawn
+    return rows[:top_n]
+
+def scan_session(stocks, sess):
+    """Pre-market or after-hours movers, with true session volume from minute bars."""
+    price_key = "pre_price" if sess == "pre" else "post_price"
+    cand = []
+    for d in stocks:
+        sp_price = d.get(price_key)
+        base = d["prev"] if sess == "pre" else d["price"]  # pre vs prior close; post vs regular close
+        if not sp_price or not base:
+            continue
+        chg = (float(sp_price) - base) / base * 100
+        if not (chg_min <= chg <= chg_max): continue
+        if not (price_min <= float(sp_price) <= price_max): continue
+        e = dict(d); e["s_price"] = float(sp_price); e["s_chg"] = chg
+        cand.append(e)
+    # bound the minute-bar fetches: rank by regular volume, keep top_n, then get true session volume
+    cand.sort(key=lambda x: x["vol"], reverse=True)
+    cand = cand[:top_n]
+    for e in cand:
+        e["s_vol"] = session_volume(get_minutes(e["sym"]), sess)
+        e["news"] = get_news(e["sym"], news_hours)
+    if require_news:
+        cand = [c for c in cand if c.get("news")]
+    cand.sort(key=lambda x: (x.get("s_vol") or 0), reverse=True)
+    return cand
 
 # ----------------------------------------------------------------------------
 # HEADER
@@ -278,7 +346,7 @@ if not FINNHUB_KEY:
                "(See DEPLOY_GUIDE.md step 4.)", icon="🔑")
 
 # ---- friendly guide for first-time visitors ----
-with st.expander("👋 New here? How to read this board (30-second guide)"):
+if st.checkbox("👋 New here? Tick this box for a 30-second guide to reading the board"):
     st.markdown("""
 **What this is.** Surge scans the market and shows stocks that are *in play right now* —
 meaning something just happened and traders are piling in. It updates itself every couple of minutes.
@@ -300,6 +368,10 @@ meaning something just happened and traders are piling in. It updates itself eve
 **Want the full story on one stock?** Use the **🔍 Inspect a ticker** box below the table — you'll get a
 live 1-minute chart, its volume minute-by-minute (pre-market, regular hours, and after-hours), the news, and the analyst price target.
 
+**Three session tabs** — **🌅 Pre-market** (4:00–9:30 AM ET), **🔔 Live market** (9:30 AM–4:00 PM ET),
+and **🌙 After-hours** (4:00–8:00 PM ET). Each shows what's moving *in that session*, with its own
+volume and news. The 🟢 marks whichever session is happening right now; the others fill in during their hours.
+
 **The S&P 500 / Outside toggle** lets you split big, well-known companies from smaller, faster-moving ones.
 
 **Tweak it to your taste** with the settings panel on the left (arrow at top-left): change how many
@@ -310,42 +382,24 @@ stocks show, the % range, how much volume counts, and the price range.
 """)
 
 # ----------------------------------------------------------------------------
-# SCANNER TABLE
+# SCAN THE UNIVERSE ONCE, THEN SPLIT INTO SESSIONS
 # ----------------------------------------------------------------------------
 with st.spinner("Scanning the market…"):
-    all_results = run_scan()
+    universe = load_universe()
 
-if not all_results:
-    st.info("No stocks currently pass all your filters. Try widening the % range, lowering "
-            "relative volume, or turning off 'require news' in the sidebar. "
-            "(Outside U.S. market hours the mover lists can also be thin.)")
+if not universe:
+    st.info("Couldn't load any movers right now — outside U.S. hours the lists thin out, or "
+            "Yahoo is briefly unavailable. It retries on the next refresh.")
     st.stop()
 
-# ---- the S&P 500 toggle bar ----
-n_sp = sum(1 for d in all_results if d.get("sp500"))
-n_out = len(all_results) - n_sp
+# ---- S&P 500 filter (applies to all three session tabs) ----
+n_sp = sum(1 for d in universe if d.get("sp500"))
 view = st.radio(
     "Market",
-    [f"All ({len(all_results)})", f"S&P 500 ({n_sp})", f"Outside S&P 500 ({n_out})"],
+    [f"All ({len(universe)})", f"S&P 500 ({n_sp})", f"Outside S&P 500 ({len(universe)-n_sp})"],
     horizontal=True, label_visibility="collapsed",
 )
-if view.startswith("S&P"):
-    results = [d for d in all_results if d.get("sp500")][:top_n]
-    sub = "today's S&P 500 names"
-elif view.startswith("Outside"):
-    results = [d for d in all_results if not d.get("sp500")][:top_n]
-    sub = "names outside the S&P 500"
-else:
-    results = all_results[:top_n]
-    sub = "most active names in play"
-
-st.markdown(f"#### Top {len(results)} by volume  "
-            f"<span style='font-size:13px;color:#6b7690'>· {sub}</span>",
-            unsafe_allow_html=True)
-
-if not results:
-    st.info("No names in this group right now — try the **All** view or widen the sidebar filters.")
-    st.stop()
+stocks_f = apply_market_filter(universe, view)
 
 def float_tag(f):
     if not f: return ""
@@ -353,48 +407,119 @@ def float_tag(f):
     if f < 100e6: return "<span class='tag mid'>Mid</span>"
     return "<span class='tag mid'>Large</span>"
 
-rows_html = ""
-for i, d in enumerate(results, 1):
-    up = d["target"] and d["price"] and ((d["target"] - d["price"]) / d["price"] * 100)
-    up_html = f"<span class='up'>+{up:.0f}%</span>" if up and up >= 0 else \
-              (f"<span class='down'>{up:.0f}%</span>" if up else "—")
-    news = d.get("news")
-    cat = (f"{news['headline'][:120]}<br><small>{news['source']} · {ago(news['mins'])}</small>"
-           if news else "<small style='color:#6b7690'>no fresh headline</small>")
-    rows_html += f"""<tr>
-      <td class='l' style='color:#6b7690'>{i}</td>
-      <td class='l'><span class='sym-t'>{d['sym']}</span>{" <span class='tag mid'>S&P</span>" if d.get('sp500') else ""}<br><span class='sym-n'>{d['name'][:26]}</span></td>
-      <td>${d['price']:.2f}</td>
-      <td class='up'>▲ {d['chg']:.1f}%</td>
-      <td>{d['rvol']:.1f}×</td>
-      <td>{fmt_vol(d['vol'])}</td>
-      <td>{fmt_float(d['float'])} {float_tag(d['float'])}</td>
-      <td>{up_html}</td>
-      <td class='cat'>{cat}</td>
-    </tr>"""
+shown = {}   # every ticker displayed across the tabs → feeds the inspector below
 
-st.markdown(f"""<table class='surge'>
-  <tr>
-    <th class='l'>#</th>
-    <th class='l' title="The stock's ticker symbol and company name.">Ticker</th>
-    <th title="The latest price one share is trading at right now.">Price</th>
-    <th title="How much the price is up today vs. yesterday's close. The scan targets +5% to +10%.">% Chg</th>
-    <th title="Relative Volume — today's trading vs. a normal day. 2x means twice the usual: a sign demand is outpacing supply.">R.Vol</th>
-    <th title="Total shares traded so far today. Bigger = more interest and easier to buy or sell.">Volume</th>
-    <th title="Float — shares actually available to trade. A low float can move fast and hard on heavy buying.">Float</th>
-    <th title="How far the average analyst price target sits above today's price. A published opinion, not a guarantee.">Target</th>
-    <th class='l' title="The most recent news headline driving the move.">Why it's moving</th>
-  </tr>
-  {rows_html}</table>""", unsafe_allow_html=True)
-st.caption("💡 Hover any column header for what it means.")
+def board_table(rows, mode):
+    """mode 'regular' shows today's numbers; mode 'session' shows pre/after-hours numbers."""
+    body = ""
+    for i, d in enumerate(rows, 1):
+        up = d["target"] and d["price"] and ((d["target"] - d["price"]) / d["price"] * 100)
+        up_html = (f"<span class='up'>+{up:.0f}%</span>" if up and up >= 0
+                   else (f"<span class='down'>{up:.0f}%</span>" if up else "—"))
+        news = d.get("news")
+        cat = (f"{news['headline'][:120]}<br><small>{news['source']} · {ago(news['mins'])}</small>"
+               if news else "<small style='color:#6b7690'>no fresh headline</small>")
+        sp_mark = " <span class='tag mid'>S&P</span>" if d.get("sp500") else ""
+        price = d["s_price"] if mode == "session" else d["price"]
+        chg   = d["s_chg"]   if mode == "session" else d["chg"]
+        vol   = d.get("s_vol") if mode == "session" else d["vol"]
+        rvol_cell = f"<td>{d['rvol']:.1f}×</td>" if mode == "regular" else ""
+        body += f"""<tr>
+          <td class='l' style='color:#6b7690'>{i}</td>
+          <td class='l'><span class='sym-t'>{d['sym']}</span>{sp_mark}<br><span class='sym-n'>{d['name'][:26]}</span></td>
+          <td>${price:.2f}</td>
+          <td class='up'>▲ {chg:.1f}%</td>
+          {rvol_cell}
+          <td>{fmt_vol(vol)}</td>
+          <td>{fmt_float(d['float'])} {float_tag(d['float'])}</td>
+          <td>{up_html}</td>
+          <td class='cat'>{cat}</td>
+        </tr>"""
+        shown[d["sym"]] = d
+    if mode == "regular":
+        vol_h = 'title="Total shares traded so far today.">Volume'
+        rvol_h = ('<th title="Relative Volume — today\'s trading vs. a normal day. '
+                  '2x means twice the usual: demand outpacing supply.">R.Vol</th>')
+    else:
+        vol_h = 'title="Shares traded during this session only (pre-market or after-hours).">Session Vol'
+        rvol_h = ''
+    st.markdown(f"""<table class='surge'>
+      <tr>
+        <th class='l'>#</th>
+        <th class='l' title="The stock's ticker symbol and company name.">Ticker</th>
+        <th title="Share price in this session.">Price</th>
+        <th title="How far the price has moved. Pre-market is vs. yesterday's close; after-hours is vs. the 4 PM close.">% Chg</th>
+        {rvol_h}
+        <th {vol_h}</th>
+        <th title="Float — shares actually available to trade. A low float can move fast and hard.">Float</th>
+        <th title="How far the average analyst price target sits above today's price. An opinion, not a guarantee.">Target</th>
+        <th class='l' title="The most recent news headline driving the move.">Why it's moving</th>
+      </tr>
+      {body}</table>""", unsafe_allow_html=True)
+
+sess = current_session()
+def dot(s): return " 🟢" if s == sess else ""
+tab_pre, tab_live, tab_post = st.tabs(
+    [f"🌅 Pre-market{dot('pre')}", f"🔔 Live market{dot('live')}", f"🌙 After-hours{dot('post')}"])
+
+with tab_pre:
+    st.caption("Pre-market · 4:00–9:30 AM ET · moves measured vs. yesterday's close"
+               + ("  ·  **live now**" if sess == "pre" else ""))
+    rows = scan_session(stocks_f, "pre")
+    if rows:
+        board_table(rows, "session")
+    else:
+        st.info("No pre-market movers pass your filters right now. Pre-market data starts filling in "
+                "around 4 AM ET — during the regular day this tab is usually empty.")
+
+with tab_live:
+    st.caption("Regular hours · 9:30 AM–4:00 PM ET"
+               + ("  ·  **live now**" if sess == "live" else ""))
+    rows = scan_regular(stocks_f)
+    if rows:
+        board_table(rows, "regular")
+    else:
+        st.info("No stocks pass all three filters right now. Widen the % range, lower relative volume, "
+                "or turn off 'require news' in the sidebar — see the note below on why the list can be short.")
+
+with tab_post:
+    st.caption("After-hours · 4:00–8:00 PM ET · moves measured vs. the 4 PM close"
+               + ("  ·  **live now**" if sess == "post" else ""))
+    rows = scan_session(stocks_f, "post")
+    if rows:
+        board_table(rows, "session")
+    else:
+        st.info("No after-hours movers pass your filters right now. After-hours data starts filling in "
+                "after 4 PM ET — before then this tab is usually empty.")
+
+st.caption("💡 Hover any column header for what it means. The 🟢 marks the session that's live right now.")
+
+# why the list may be short
+if st.checkbox("❓ Only seeing a few names? Tick this box to learn why (and how to see more)"):
+    st.markdown("""
+That's usually **working as intended** — the whole point is a *short, high-quality* list. A stock only
+appears if it clears **all three** filters at once (up 5–10%, ≥2× volume, *and* fresh news), and at any
+given moment only a handful of the day's ~thousands of stocks do. Two or three names is normal; sometimes
+zero, especially near the open/close or outside U.S. hours.
+
+**To see more, open the sidebar (arrow, top-left) and:**
+- turn **off** "Require a fresh news catalyst" (the news filter is the strictest one),
+- widen the **% change** range (e.g. 3% to 20%),
+- lower **min relative volume** (e.g. 1.5×),
+- raise **"Show top N by volume."**
+
+Loosening trades quality for quantity — your call.""")
+
+if not shown:
+    st.stop()
 
 # ----------------------------------------------------------------------------
 # PER-TICKER DETAIL  (pick one to inspect)
 # ----------------------------------------------------------------------------
 st.markdown("---")
-syms = [d["sym"] for d in results]
-pick = st.selectbox("🔍 Inspect a ticker", syms, index=0)
-d = next(x for x in results if x["sym"] == pick)
+syms = list(shown.keys())
+pick = st.selectbox("🔍 Inspect a ticker (live chart · minute volume · news · price target)", syms, index=0)
+d = shown[pick]
 
 sp_tag = ("<b style='color:#2ecb8f'>S&P 500</b>" if d.get("sp500")
           else "<span style='color:#a6b0c3'>Outside S&P 500</span>")
@@ -418,102 +543,4 @@ with tab_ov:
         # a plain-language read on why volume is moving
         st.markdown(
             f"<div style='background:#141924;border-left:3px solid #f0a63a;border-radius:8px;"
-            f"padding:12px 14px;margin:6px 0 12px;color:#c9d2e0;font-size:14px'>"
-            f"The move started when this story broke ~{ago(news['mins'])}, and volume immediately "
-            f"jumped to <b>{d['rvol']:.1f}× normal</b>. That's the market repricing "
-            f"<b>{d['name']}</b> on the news — demand outpacing supply, not random drift.</div>",
-            unsafe_allow_html=True)
-        if news.get("summary"):
-            st.write(news["summary"])
-        if news.get("url"):
-            st.markdown(f"[Read full story →]({news['url']})")
-        # deeper: more recent coverage
-        more = news.get("more") or []
-        if more:
-            st.markdown(f"**More coverage** · {news.get('count', len(more))} recent stories")
-            for m in more:
-                link = f"[{m['headline']}]({m['url']})" if m.get("url") else m["headline"]
-                st.markdown(
-                    f"<div style='padding:7px 0;border-top:1px solid #1a202d;font-size:13px'>"
-                    f"{link}<br><span style='color:#6b7690;font-size:11px'>{m['source']} · {ago(m['mins'])}</span></div>",
-                    unsafe_allow_html=True)
-    else:
-        st.info("No fresh headline found in the news window for this name. "
-                "Widen the news window in the sidebar to see older stories.")
-
-# ---- Chart: live TradingView 1-minute ----
-with tab_chart:
-    st.caption("Live interactive 1-minute chart · powered by TradingView")
-    tv = f"""
-    <div class="tradingview-widget-container" style="height:460px">
-      <div id="tv_{d['sym']}" style="height:460px"></div>
-      <script src="https://s3.tradingview.com/tv.js"></script>
-      <script>
-      new TradingView.widget({{
-        "autosize": true, "symbol": "{d['sym']}", "interval": "1",
-        "timezone": "America/New_York", "theme": "dark", "style": "1",
-        "locale": "en", "hide_top_toolbar": false, "hide_legend": false,
-        "allow_symbol_change": true, "container_id": "tv_{d['sym']}"
-      }});
-      </script>
-    </div>"""
-    components.html(tv, height=470)
-    st.caption("If the chart is blank, TradingView may need an exchange prefix "
-               "(e.g. NASDAQ:AAPL) — use the symbol box on the chart itself.")
-
-# ---- Volume: session split + per-minute chart ----
-with tab_vol:
-    h = get_minutes(d["sym"])
-    if h is None or h.empty:
-        st.info("Minute data isn't available for this ticker right now.")
-    else:
-        t = h.index.time
-        def sess(x):
-            if x < dt.time(9, 30): return "Pre-market"
-            if x < dt.time(16, 0): return "Regular"
-            return "Post-market"
-        h = h.copy()
-        h["Session"] = [sess(x) for x in t]
-        totals = h.groupby("Session")["Volume"].sum()
-        tot = totals.sum() or 1
-        s1, s2, s3 = st.columns(3)
-        for col, name in [(s1, "Pre-market"), (s2, "Regular"), (s3, "Post-market")]:
-            v = int(totals.get(name, 0))
-            col.metric(name, fmt_vol(v), f"{v/tot*100:.0f}% of day")
-
-        st.markdown("**Volume per minute** — watch the ramp; a spike is demand outpacing supply *now*.")
-        st.bar_chart(h["Volume"], height=240, color="#2ecb8f")
-
-# ---- Price target: real analyst consensus ----
-with tab_tgt:
-    if not d["target"] or not d["n_analysts"]:
-        st.info("No analyst price-target coverage for this ticker.")
-    else:
-        up = (d["target"] - d["price"]) / d["price"] * 100
-        st.markdown(f"<div style='text-align:center'>"
-                    f"<div style='font-size:40px;font-weight:700;color:{'#2ecb8f' if up>=0 else '#f0685a'};"
-                    f"font-family:IBM Plex Mono,monospace'>{'+' if up>=0 else ''}{up:.0f}%</div>"
-                    f"<div style='color:#6b7690'>upside to consensus target "
-                    f"<b class='mono'>${d['target']:.2f}</b> · {d['n_analysts']} analysts</div></div>",
-                    unsafe_allow_html=True)
-        lo, hi = d.get("target_lo"), d.get("target_hi")
-        if lo and hi and hi > lo:
-            pos = max(0, min(100, (d["price"] - lo) / (hi - lo) * 100))
-            tpos = max(0, min(100, (d["target"] - lo) / (hi - lo) * 100))
-            st.markdown(f"""
-            <div style='margin:26px 4px 6px;position:relative;height:8px;border-radius:5px;
-                 background:linear-gradient(90deg,#3a1c1a,#212836,#123027)'>
-              <div style='position:absolute;left:{pos:.0f}%;top:-6px;width:12px;height:12px;border-radius:50%;
-                   background:#e9edf5;border:2px solid #0c0f16;transform:translateX(-50%)'></div>
-              <div style='position:absolute;left:{tpos:.0f}%;top:-6px;width:12px;height:12px;border-radius:50%;
-                   background:#2ecb8f;border:2px solid #0c0f16;transform:translateX(-50%)'></div>
-            </div>
-            <div style='display:flex;justify-content:space-between;font-size:11px;color:#6b7690;
-                 font-family:IBM Plex Mono,monospace'><span>low ${lo:.2f}</span>
-                 <span>⚪ now &nbsp; 🟢 target</span><span>high ${hi:.2f}</span></div>
-            """, unsafe_allow_html=True)
-        st.warning("These are **real published analyst targets** — not a prediction of where the "
-                   "news will take the stock. Targets are opinions, often lag fast-moving news, and "
-                   "are frequently wrong. Never a substitute for your own research.", icon="⚠️")
-
-st.caption("Surge surfaces candidates · not financial advice · a stock already up on the day can reverse.")
+      
